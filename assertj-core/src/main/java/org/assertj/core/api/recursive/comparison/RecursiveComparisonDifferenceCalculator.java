@@ -14,12 +14,12 @@ package org.assertj.core.api.recursive.comparison;
 
 import static java.lang.String.format;
 import static java.util.Objects.deepEquals;
+import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.joining;
 import static org.assertj.core.api.recursive.comparison.ComparisonDifference.rootComparisonDifference;
-import static org.assertj.core.api.recursive.comparison.DualValue.DEFAULT_ORDERED_COLLECTION_TYPES;
 import static org.assertj.core.api.recursive.comparison.FieldLocation.rootFieldLocation;
+import static org.assertj.core.api.recursive.comparison.TypeChecks.DEFAULT_ORDERED_COLLECTION_TYPES;
 import static org.assertj.core.util.IterableUtil.sizeOf;
-import static org.assertj.core.util.IterableUtil.toCollection;
 import static org.assertj.core.util.Lists.list;
 import static org.assertj.core.util.Sets.newHashSet;
 
@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
@@ -43,9 +44,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import org.assertj.core.internal.DeepDifference;
+import org.assertj.core.util.Arrays;
 
 /**
  * Based on {@link DeepDifference} but takes a {@link RecursiveComparisonConfiguration}, {@link DeepDifference}
@@ -440,8 +444,8 @@ public class RecursiveComparisonDifferenceCalculator {
     Iterator<?> expectedIterator = expectedCollection.iterator();
     int i = 0;
     for (Object element : actualCollection) {
-      FieldLocation elementFielLocation = dualValue.fieldLocation.field(format("[%d]", i));
-      DualValue elementDualValue = new DualValue(elementFielLocation, element, expectedIterator.next());
+      FieldLocation elementFieldLocation = dualValue.fieldLocation.field(format("[%d]", i));
+      DualValue elementDualValue = new DualValue(elementFieldLocation, element, expectedIterator.next());
       comparisonState.registerForComparison(elementDualValue);
       i++;
     }
@@ -467,39 +471,159 @@ public class RecursiveComparisonDifferenceCalculator {
       // no need to inspect elements, iterables are not equal as they don't have the same size
       return;
     }
-    // copy actual as we will remove elements found in expected
-    Collection<?> actualCopy = new LinkedList<>(toCollection(actual));
+    // group by deep hash code
+    Map<Integer, ? extends List<?>> actualByDeepHashCode = StreamSupport.stream(actual.spliterator(), false)
+      .collect(groupingBy(obj -> deepHashCode(obj, comparisonState.recursiveComparisonConfiguration), Collectors.toList()));
     List<Object> expectedElementsNotFound = list();
     for (Object expectedElement : expected) {
       boolean expectedElementMatched = false;
-      // compare recursively expectedElement to all remaining actual elements
-      Iterator<?> actualIterator = actualCopy.iterator();
-      while (actualIterator.hasNext()) {
-        Object actualElement = actualIterator.next();
-        // we need to get the currently visited dual values otherwise a cycle would cause an infinite recursion.
-        List<ComparisonDifference> differences = determineDifferences(actualElement, expectedElement, dualValue.fieldLocation,
-                                                                      comparisonState.visitedDualValues,
-                                                                      comparisonState.recursiveComparisonConfiguration);
-        if (differences.isEmpty()) {
-          // found an element in actual matching expectedElement, remove it as it can't be used to match other expected elements
-          actualIterator.remove();
-          expectedElementMatched = true;
-          // jump to next actual element check
-          break;
-        }
+      // First try recursively comparing expectedElement to actual elements with the same deep hash code.
+      Integer expectedHash = deepHashCode(expectedElement, comparisonState.recursiveComparisonConfiguration);
+      List<?> actualHashBucket = actualByDeepHashCode.get(expectedHash);
+      if (actualHashBucket != null) {
+        Iterator<?> actualIterator = actualHashBucket.iterator();
+        expectedElementMatched = searchIterableForElement(actualIterator, expectedElement, dualValue, comparisonState);
       }
+      // It may be that expectedElement matches an actual element in a different hash bucket
+      // as the deepHashCode method does not replicate the full set of configuration options used
+      // in a recursive comparison. To account for this, we check the other actual elements for
+      // matches. This may result in O(n^2) complexity in the worst case.
       if (!expectedElementMatched) {
-        expectedElementsNotFound.add(expectedElement);
+        for (Map.Entry<Integer, ? extends List<?>> entry : actualByDeepHashCode.entrySet()) {
+          // avoid checking the same bucket twice
+          if (entry.getKey().equals(expectedHash)) {
+            continue;
+          }
+          Iterator<?> actualIterator = entry.getValue().iterator();
+          expectedElementMatched = searchIterableForElement(actualIterator, expectedElement, dualValue, comparisonState);
+          if (expectedElementMatched) {
+            break;
+          }
+        }
+        if (!expectedElementMatched) {
+          expectedElementsNotFound.add(expectedElement);
+        }
       }
     }
 
     if (!expectedElementsNotFound.isEmpty()) {
       String unmatched = format("The following expected elements were not matched in the actual %s:%n  %s",
-                                actual.getClass().getSimpleName(), expectedElementsNotFound);
+        actual.getClass().getSimpleName(), expectedElementsNotFound);
       comparisonState.addDifference(dualValue, unmatched);
       // TODO could improve the error by listing the actual elements not in expected but that would need
       // another double loop inverting actual and expected to find the actual elements not matched in expected
     }
+  }
+
+  private static boolean searchIterableForElement(Iterator<?> actualIterator, Object expectedElement,
+                                                  DualValue dualValue, ComparisonState comparisonState) {
+    while (actualIterator.hasNext()) {
+      Object actualElement = actualIterator.next();
+      // we need to get the currently visited dual values otherwise a cycle would cause an infinite recursion.
+      List<ComparisonDifference> differences = determineDifferences(actualElement, expectedElement,
+                                                                    dualValue.fieldLocation,
+                                                                    comparisonState.visitedDualValues,
+                                                                    comparisonState.recursiveComparisonConfiguration);
+      if (differences.isEmpty()) {
+        // found an element in actual matching expectedElement, remove it as it can't be used to match other expected elements
+        actualIterator.remove();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Get a deterministic hashCode (int) value for an Object, regardless of
+   * when it was created or where it was loaded into memory. The problem with
+   * java.lang.Object.hashCode() is that it essentially relies on memory
+   * location of an object (what identity it was assigned), whereas this
+   * method will produce the same hashCode for any object graph, regardless of
+   * how many times it is created.<br>
+   * <br>
+   *
+   * This method will handle cycles correctly (A-&gt;B-&gt;C-&gt;A). In this
+   * case, Starting with object A, B, or C would yield the same hashCode. If
+   * an object encountered (root, subobject, etc.) has a hashCode() method on
+   * it (that is not Object.hashCode()), that hashCode() method will be called
+   * and it will stop traversal on that branch.
+   *
+   * @param obj Object who hashCode is desired.
+   * @return the 'deep' hashCode value for the passed in object.
+   */
+  static int deepHashCode(Object obj,
+                          RecursiveComparisonConfiguration recursiveComparisonConfiguration) {
+    Set<Object> visited = new HashSet<>();
+    LinkedList<Object> stack = new LinkedList<>();
+    stack.addFirst(obj);
+    int hash = 0;
+
+    while (!stack.isEmpty()) {
+      obj = stack.removeFirst();
+      if (obj == null || visited.contains(obj)) {
+        continue;
+      }
+
+      visited.add(obj);
+
+      if (obj instanceof Double || obj instanceof Float) {
+        // just take the integral value for hashcode
+        // equality tests things more comprehensively
+        stack.addFirst(Math.round(((Number) obj).doubleValue()));
+        continue;
+      }
+
+      if (Arrays.isArray(obj)) {
+        int len = Array.getLength(obj);
+        for (int i = 0; i < len; i++) {
+          stack.addFirst(Array.get(obj, i));
+        }
+        continue;
+      }
+
+      if (TypeChecks.isAnIterable(obj)) {
+        for (Object element : (Iterable<?>) obj) {
+          stack.addFirst(element);
+        }
+        continue;
+      }
+
+      if (obj instanceof Optional) {
+        ((Optional<?>) obj).ifPresent(stack::addFirst);
+        continue;
+      }
+
+      if (obj instanceof Map) {
+        stack.addAll(0, ((Map<?, ?>) obj).keySet());
+        stack.addAll(0, ((Map<?, ?>) obj).values());
+        continue;
+      }
+
+      if (TypeChecks.isAtomic(obj)) {
+        // ignore these to keep things simple
+        continue;
+      }
+
+      if (shouldHonorEquals(obj)) {
+        // if the object can be compared using equality, we use its hash code
+        hash += obj.hashCode();
+      }
+
+      Set<String> childrenNodesNames = recursiveComparisonConfiguration.getChildrenNodeNamesOf(obj);
+      for (String childNodeName : childrenNodesNames) {
+        Object childNodeValue = recursiveComparisonConfiguration.getValue(childNodeName, obj);
+        stack.addFirst(childNodeValue);
+      }
+    }
+    return hash;
+  }
+
+  private static boolean shouldHonorEquals(Object obj) {
+    // since java 17 we can't introspect java types and get their fields so by default we compare them with equals
+    // unless for some container like java types: iterables, array, optional, atomic values where we take the contained values
+    // through accessors and register them in the recursive comparison.
+    boolean shouldHonorJavaTypeEquals = TypeChecks.isJavaType(obj) && !TypeChecks.isContainer(obj);
+    return shouldHonorJavaTypeEquals || hasOverriddenEquals(obj.getClass());
   }
 
   // TODO replace by ordered map

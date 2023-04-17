@@ -16,11 +16,8 @@ import static java.lang.String.format;
 import static java.util.Collections.unmodifiableList;
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.recursive.comparison.FieldLocation.rootFieldLocation;
-import static org.assertj.core.util.Arrays.array;
 import static org.assertj.core.util.Arrays.isArray;
 
-import java.nio.file.Path;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -29,7 +26,6 @@ import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.SortedMap;
-import java.util.SortedSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
@@ -37,12 +33,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
-import java.util.stream.Stream;
 
 // logically immutable
 public final class DualValue {
-
-  static final Class<?>[] DEFAULT_ORDERED_COLLECTION_TYPES = array(List.class, SortedSet.class, LinkedHashSet.class);
 
   final FieldLocation fieldLocation;
   final Object actual;
@@ -109,24 +102,15 @@ public final class DualValue {
   }
 
   public boolean isActualJavaType() {
-    return isJavaType(actual);
+    return TypeChecks.isJavaType(actual);
   }
 
   public boolean isExpectedJavaType() {
-    return isJavaType(expected);
+    return TypeChecks.isJavaType(expected);
   }
 
   public boolean hasSomeJavaTypeValue() {
     return isActualJavaType() || isExpectedJavaType();
-  }
-
-  private static boolean isJavaType(Object o) {
-    if (o == null) return false;
-    String className = o.getClass().getName();
-    return className.startsWith("java.")
-           || className.startsWith("javax.")
-           || className.startsWith("sun.")
-           || className.startsWith("com.sun.");
   }
 
   public boolean isExpectedFieldAnArray() {
@@ -253,53 +237,19 @@ public final class DualValue {
   }
 
   public boolean isActualFieldAnOrderedCollection() {
-    return isAnOrderedCollection(actual);
+    return TypeChecks.isAnOrderedCollection(actual);
   }
 
   public boolean isExpectedFieldAnOrderedCollection() {
-    return isAnOrderedCollection(expected);
+    return TypeChecks.isAnOrderedCollection(expected);
   }
 
   public boolean isActualFieldAnIterable() {
-    return isAnIterable(actual);
+    return TypeChecks.isAnIterable(actual);
   }
 
   public boolean isExpectedFieldAnIterable() {
-    return isAnIterable(expected);
-  }
-
-  private static boolean isAnIterable(Object value) {
-    // Don't consider Path as an Iterable as recursively comparing them leads to a stack overflow, here's why:
-    // Iterable are compared element by element recursively
-    // Ex: /tmp/foo.txt path has /tmp as its first element
-    // so /tmp is going to be compared recursively but /tmp first element is itself leading to an infinite recursion
-    // Don't consider ValueNode as an Iterable as they only contain one value and iterating them does not make sense.
-    // Don't consider or ObjectNode as an Iterable as it holds a map but would only iterate on values and not entries.
-    return value instanceof Iterable && !(value instanceof Path || isAJsonValueNode(value) || isAnObjectNode(value));
-  }
-
-  private static boolean isAJsonValueNode(Object value) {
-    try {
-      Class<?> valueNodeClass = Class.forName("com.fasterxml.jackson.databind.node.ValueNode");
-      return valueNodeClass.isInstance(value);
-    } catch (ClassNotFoundException e) {
-      // value cannot be a ValueNode because the class couldn't be located
-      return false;
-    }
-  }
-
-  private static boolean isAnObjectNode(Object value) {
-    try {
-      Class<?> objectNodeClass = Class.forName("com.fasterxml.jackson.databind.node.ObjectNode");
-      return objectNodeClass.isInstance(value);
-    } catch (ClassNotFoundException e) {
-      // value cannot be an ObjectNode because the class couldn't be located
-      return false;
-    }
-  }
-
-  private static boolean isAnOrderedCollection(Object value) {
-    return Stream.of(DEFAULT_ORDERED_COLLECTION_TYPES).anyMatch(type -> type.isInstance(value));
+    return TypeChecks.isAnIterable(expected);
   }
 
   public boolean isExpectedAnEnum() {
@@ -311,30 +261,16 @@ public final class DualValue {
   }
 
   public boolean hasNoContainerValues() {
-    return !isContainer(actual) && !isExpectedAContainer();
+    return !TypeChecks.isContainer(actual) && !isExpectedAContainer();
   }
 
   // TODO test
   public boolean isExpectedAContainer() {
-    return isContainer(expected);
+    return TypeChecks.isContainer(expected);
   }
 
   public boolean hasNoNullValues() {
     return actual != null && expected != null;
-  }
-
-  private static boolean isContainer(Object o) {
-    return o instanceof Iterable ||
-           o instanceof Map ||
-           o instanceof Optional ||
-           o instanceof AtomicReference ||
-           o instanceof AtomicReferenceArray ||
-           o instanceof AtomicBoolean ||
-           o instanceof AtomicInteger ||
-           o instanceof AtomicIntegerArray ||
-           o instanceof AtomicLong ||
-           o instanceof AtomicLongArray ||
-           isArray(o);
   }
 
   public boolean hasPotentialCyclingValues() {
